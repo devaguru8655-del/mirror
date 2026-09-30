@@ -341,73 +341,36 @@ export const questions = [
 ];
 
 export const calculateTraits = (answers) => {
-  const traitCounts = {
-    risk_level: { high: 0, medium: 0, low: 0 },
-    emotional_response: { anxious: 0, calm: 0, expressive: 0, resilient: 0, conflicted: 0, growth: 0 },
-    decision_style: { impulsive: 0, analytical: 0, intuitive: 0, cautious: 0, practical: 0 },
-    social_behavior: { direct: 0, passive: 0, playful: 0, assertive: 0, accommodating: 0 },
-    confidence_level: { high: 0, medium: 0, low: 0 },
-    moral_alignment: { honest: 0, selfish: 0, neutral: 0, biased: 0 }
-  };
+  // Counts start empty so a trait only wins if some answer actually set it.
+  // Question data can change between sessions, so missing questions are
+  // skipped rather than throwing.
+  const traitCounts = {};
+  let answeredCount = 0;
 
   answers.forEach((answer) => {
-    const question = questions.find(q => q.id === answer.questionId);
-    const selectedOption = question.options.find(o => o.id === answer.answer);
-    
-    if (selectedOption && selectedOption.traits) {
-      Object.entries(selectedOption.traits).forEach(([trait, value]) => {
-        if (traitCounts[trait]) {
-          traitCounts[trait][value] = (traitCounts[trait][value] || 0) + 1;
-        }
-      });
-    }
+    // Storage can hold stale/corrupt entries - skip rather than throw.
+    if (!answer || typeof answer !== 'object') return;
+    const question = questions.find((q) => q.id === answer.questionId);
+    if (!question) return;
+    const selectedOption = question.options.find((o) => o.id === answer.answer);
+    if (!selectedOption?.traits) return;
+    answeredCount += 1;
+
+    Object.entries(selectedOption.traits).forEach(([trait, value]) => {
+      if (!traitCounts[trait]) traitCounts[trait] = {};
+      traitCounts[trait][value] = (traitCounts[trait][value] || 0) + 1;
+    });
   });
 
   const dominantTraits = {};
   Object.entries(traitCounts).forEach(([trait, values]) => {
     const maxValue = Math.max(...Object.values(values));
-    if (maxValue > 0) {
-      const dominant = Object.entries(values).find(([_, v]) => v === maxValue)?.[0];
-      dominantTraits[trait] = dominant;
-    }
+    if (maxValue <= 0) return;
+    // Ties resolve by first key encountered - stable across runs.
+    const dominant = Object.entries(values).find(([, v]) => v === maxValue)?.[0];
+    if (dominant) dominantTraits[trait] = dominant;
   });
 
+  dominantTraits.completion = `${answeredCount}/${questions.length}`;
   return dominantTraits;
-};
-
-export const generateResponse = (userMessage, traits, chatHistory) => {
-  const responses = {
-    risk_level: {
-      high: ["Idhu konjam risky da... but worth irundha try pannalam.", "Let's just go for it!", "No time like the present - let's do this!"],
-      medium: "Hmm, could work. Let's think about it properly.",
-      low: "Better be careful here... not rushing into anything."
-    },
-    emotional_response: {
-      anxious: "Okay okay, let's not panic. We'll figure this out.",
-      calm: "Alright, let's keep a clear head here.",
-      expressive: "I feel you! That's totally valid.",
-      resilient: "Aiyyo, no problem. We'll bounce back!",
-      growth: "This is actually a learning opportunity, right?"
-    },
-    decision_style: {
-      impulsive: "Just do it! What's the worst that could happen?",
-      analytical: "Let me break this down properly...",
-      intuitive: "My gut says this is the right call.",
-      cautious: "Let's not rush. Think step by step.",
-      practical: "What makes the most sense logically?"
-    },
-    social_behavior: {
-      direct: "I'll just say it how it is.",
-      playful: "Aiyyo serially! 😂",
-      assertive: "No, listen to me properly.",
-      accommodating: "Whatever works for everyone, I'm good."
-    },
-    confidence_level: {
-      high: "I'm pretty sure about this.",
-      medium: "I think this is right, but not 100% certain.",
-      low: "I'm not entirely sure honestly..."
-    }
-  };
-
-  return `Based on your profile: ${JSON.stringify(traits)} - "${userMessage}"`;
 };

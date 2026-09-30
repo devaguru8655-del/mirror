@@ -1,122 +1,155 @@
-import { useState, useEffect, useRef } from 'react';
-import { getGroqChatCompletion } from '../utils/groq';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { getGroqChatCompletion, isValidGroqKey } from '../utils/groq';
+import { speak, createRecognition, sttSupported, ttsSupported } from '../utils/speech';
+import { safeGet, safeSet, safeRemove } from '../utils/storage';
+
+const API_KEY = 'groq_api_key';
+const CHAT_KEY = 'chatHistory';
 
 export default function Chat({ personaData, userName }) {
-  const [messages, setMessages] = useState([]);
+  const navigate = useNavigate();
+  const [messages, setMessages] = useState(() => safeGet(CHAT_KEY, []) ?? []);
   const [input, setInput] = useState('');
   const [isListening, setIsListening] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   const [transcript, setTranscript] = useState('');
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('groq_api_key') || '');
-  const [showKeyInput, setShowKeyInput] = useState(() => !localStorage.getItem('groq_api_key'));
+  const [apiKey, setApiKey] = useState(() => safeGet(API_KEY, '') ?? '');
+  const [showKeyInput, setShowKeyInput] = useState(() => !safeGet(API_KEY, ''));
+  const [keyDraft, setKeyDraft] = useState('');
   const [keyError, setKeyError] = useState('');
-  
+  const [chatError, setChatError] = useState('');
+
   const messagesEndRef = useRef(null);
   const recognitionRef = useRef(null);
-  const synthRef = useRef(null);
+  const transcriptRef = useRef('');
+  const abortRef = useRef(null);
+  const synthStopRef = useRef(null);
+
+  // No persona means no voice output - and we tell the user instead of
+  // dropping them into a chat that quietly stays empty.
+  const hasPersona = Boolean(personaData && personaData.traits);
 
   useEffect(() => {
-    if (!personaData) return;
-    
-    setMessages([{
-      id: 1,
-      sender: 'ai',
-      text: `Hey! I'm your AI replica. I'm built to think and respond like YOU would. Let's chat!`,
-      traits: personaData.traits
-    }]);
-
-    if (typeof window !== 'undefined' && 'webkitSpeechRecognition' in window) {
-      const SpeechRecognition = window.webkitSpeechRecognition || window.SpeechRecognition;
-      recognitionRef.current = new SpeechRecognition();
-      recognitionRef.current.continuous = false;
-      recognitionRef.current.interimResults = true;
-      
-      recognitionRef.current.onresult = (event) => {
-        const result = event.results[0][0].transcript;
-        setTranscript(result);
-        setInput(result);
-      };
-      
-      recognitionRef.current.onend = () => {
-        setIsListening(false);
-      };
-    }
-
-    synthRef.current = window.speechSynthesis;
-
-    return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.abort();
-      }
-    };
-  }, [personaData]);
+    if (!hasPersona && messages.length === 0) return;
+    safeSet(CHAT_KEY, messages);
+  }, [messages, hasPersona]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, isTyping]);
 
-  const speakResponse = (text) => {
-    if (!synthRef.current) return;
-    
-    synthRef.current.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 0.9;
-    utterance.onstart = () => setIsSpeaking(true);
-    utterance.onend = () => setIsSpeaking(false);
-    synthRef.current.speak(utterance);
+  // Abort in-flight requests and silence TTS on unmount.
+  useEffect(
+    () => () => {
+      abortRef.current?.abort();
+      synthStopRef.current?.();
+      try {
+        recognitionRef.current?.abort();
+      } catch {
+        /* already stopped */
+      }
+    },
+    [],
+  );
+
+  const speakResponse = useCallback((text) => {
+    if (!ttsSupported) return;
+    synthStopRef.current?.();
+    synthStopRef.current = speak(text, {
+      onStart: () => setSpeaking(true),
+      onEnd: () => setSpeaking(false),
+    });
+  }, []);
+
+  const handleSaveKey = () => {
+    const key = keyDraft.trim();
+    if (!isValidGroqKey(key)) {
+      setKeyError('Keys look like gsk_ followed by a long string. Check it.');
+      return;
+    }
+    safeSet(API_KEY, key);
+    setApiKey(key);
+    setKeyError('');
+    setShowKeyInput(false);
   };
 
   const startListening = () => {
-    if (recognitionRef.current) {
-      setTranscript('');
-      setIsListening(true);
-      recognitionRef.current.start();
-    }
-  };
+    if (isListening || speaking || isTyping) return;
+    setTranscript('');
+    transcriptRef.current = '';
 
-  const handleSaveKey = () => {
-    if (apiKey.trim().length > 10) {
-      localStorage.setItem('groq_api_key', apiKey.trim());
-      setShowKeyInput(false);
-      setKeyError('');
-    } else {
-      setKeyError('Please enter a valid Groq API key');
-    }
-  };
+    const recognition = createRecognition({
+      onTranscript: (text) => {
+        transcriptRef.current = text;
+        setTranscript(text);
+      },
+      onEnd: () => {
+        setIsListening(false);
+        const text = transcriptRef.current.trim();
+        if (text) setInput(text);
+      },
+      onError: (code) => {
+        setIsListening(false);
+        setChatError(code === 'not-allowed' ? 'Mic permission blocked.' : 'Voice input failed.');
+      },
+    });
 
-  const handleSend = async () => {
-    if (!input.trim()) return;
-    if (!apiKey && showKeyInput) {
-      setShowKeyInput(true);
+    if (!recognition) {
+      setChatError('Voice input is not supported in this browser.');
       return;
     }
-    
-    const userMsg = input.trim();
+    recognitionRef.current = recognition;
+    setIsListening(true);
+    try {
+      recognition.start();
+    } catch {
+      setIsListening(false);
+      setChatError('Could not start listening.');
+    }
+  };
+
+  const handleSend = async (override) => {
+    const text = (override ?? input).trim();
+    if (!text || isTyping) return;
+    if (!hasPersona) {
+      navigate('/interview');
+      return;
+    }
+    if (!isValidGroqKey(apiKey)) {
+      setShowKeyInput(true);
+      setKeyError('Add your Groq API key to start chatting.');
+      return;
+    }
+
     setInput('');
-    
-    setMessages(prev => [...prev, { id: Date.now(), sender: 'user', text: userMsg }]);
+    setChatError('');
+    setTranscript('');
+    transcriptRef.current = '';
+
+    const nextMessages = [...messages, { id: Date.now(), role: 'user', content: text }];
+    setMessages(nextMessages);
     setIsTyping(true);
 
-    try {
-      const chatMessages = messages.map(msg => ({
-        role: msg.sender === 'ai' ? 'assistant' : 'user',
-        content: msg.text
-      }));
-      chatMessages.push({ role: 'user', content: userMsg });
+    abortRef.current = new AbortController();
 
-      const aiResponse = await getGroqChatCompletion(apiKey, chatMessages, personaData.traits);
-      
-      setMessages(prev => [...prev, { id: Date.now() + 1, sender: 'ai', text: aiResponse }]);
-      speakResponse(aiResponse);
-    } catch (error) {
-      setMessages(prev => [...prev, { 
-        id: Date.now() + 1, 
-        sender: 'ai', 
-        text: `Oops! Something went wrong: ${error.message}` 
-      }]);
+    try {
+      const reply = await getGroqChatCompletion({
+        apiKey,
+        messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
+        traits: personaData.traits,
+        answers: personaData.answers ?? [],
+        userName,
+        signal: abortRef.current.signal,
+      });
+      setMessages((prev) => [...prev, { id: Date.now() + 1, role: 'assistant', content: reply }]);
+      speakResponse(reply);
+    } catch (err) {
+      setChatError(err.message || 'Something went wrong.');
     } finally {
       setIsTyping(false);
+      abortRef.current = null;
     }
   };
 
@@ -129,122 +162,163 @@ export default function Chat({ personaData, userName }) {
           </div>
           <div>
             <h1 className="font-semibold text-[#2D3748]">Your AI Replica</h1>
-            <p className="text-xs text-[#8B5CF6]">Powered by Groq Llama 3</p>
+            <p className="text-xs text-[#8B5CF6]">
+              {hasPersona ? `Speaking as ${userName || 'you'}` : 'Persona not built yet'}
+            </p>
           </div>
         </div>
-        <button
-          onClick={() => setShowKeyInput(!showKeyInput)}
-          className="px-3 py-1 text-sm text-[#8B5CF6]"
-        >
-          ⚙️
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowKeyInput((v) => !v)}
+            className="px-3 py-1 rounded-full text-sm text-[#8B5CF6] hover:bg-white/40"
+            aria-label="Chat settings"
+          >
+            ⚙️
+          </button>
+          <button
+            onClick={() => {
+              setMessages([]);
+              safeRemove(CHAT_KEY);
+              setChatError('');
+            }}
+            className="px-3 py-1 rounded-full text-sm text-[#8B5CF6] hover:bg-white/40 disabled:opacity-40"
+            disabled={messages.length === 0}
+            aria-label="Clear chat"
+          >
+            🗑
+          </button>
+        </div>
       </div>
 
       {showKeyInput && (
         <div className="glass-card p-4 mx-4 mt-2 rounded-2xl">
-          <p className="text-sm text-[#4A5568] mb-2">Enter your Groq API Key:</p>
+          <p className="text-sm text-[#4A5568] mb-2">Groq API key:</p>
           <div className="flex gap-2">
             <input
               type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
+              value={keyDraft}
+              onChange={(e) => setKeyDraft(e.target.value)}
               placeholder="gsk_..."
               className="flex-1 glass-input px-3 py-2 rounded-lg text-sm outline-none"
+              onKeyDown={(e) => e.key === 'Enter' && handleSaveKey()}
+              aria-label="Groq API key"
             />
-            <button
-              onClick={handleSaveKey}
-              className="px-4 py-2 rounded-lg glass-button text-white text-sm"
-            >
+            <button onClick={handleSaveKey} className="px-4 py-2 rounded-lg glass-button text-white text-sm">
               Save
             </button>
           </div>
-          {keyError && <p className="text-red-500 text-xs mt-2">{keyError}</p>}
+          {keyError && (
+            <p className="text-red-500 text-xs mt-2" role="alert">
+              {keyError}
+            </p>
+          )}
           <p className="text-xs text-gray-500 mt-2">
-            Get free key at <a href="https://console.groq.com" target="_blank" rel="noreferrer" className="underline">console.groq.com</a>
+            Free key at{' '}
+            <a
+              href="https://console.groq.com/keys"
+              target="_blank"
+              rel="noreferrer"
+              className="underline"
+            >
+              console.groq.com/keys
+            </a>
           </p>
         </div>
       )}
 
-      <div className="flex-1 glass-card rounded-b-3xl p-4 overflow-hidden flex flex-col">
-        <div className="flex-1 overflow-y-auto space-y-4 mb-4">
-          {messages.map((msg) => (
-            <div
-              key={msg.id}
-              className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}
-            >
-              <div
-                className={`message-bubble ${
-                  msg.sender === 'user'
-                    ? 'bg-gradient-to-r from-[#8B5CF6] to-[#6366F1] text-white rounded-br-md'
-                    : 'bg-white/60 text-[#2D3748] rounded-bl-md'
-                }`}
+      <div className="flex-1 glass-card rounded-b-3xl p-4 flex flex-col min-h-[70vh]">
+        <div className="flex-1 overflow-y-auto space-y-4 mb-4 pr-1">
+          {!hasPersona ? (
+            <div className="h-full flex flex-col items-center justify-center text-center gap-4">
+              <p className="text-[#4A5568]">Finish the 30-question interview first.</p>
+              <button
+                onClick={() => navigate('/interview')}
+                className="px-5 py-3 rounded-xl glass-button text-white"
               >
-                {msg.text}
-              </div>
+                Start Interview
+              </button>
             </div>
-          ))}
-          
+          ) : messages.length === 0 ? (
+            <div className="h-full flex items-center justify-center text-center text-[#4A5568] px-4">
+              Say hi, or ask yourself a question.
+            </div>
+          ) : (
+            messages.map((msg) => (
+              <div
+                key={msg.id}
+                className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+              >
+                <div
+                  className={`message-bubble ${
+                    msg.role === 'user'
+                      ? 'bg-gradient-to-r from-[#8B5CF6] to-[#6366F1] text-white rounded-br-md'
+                      : 'bg-white/60 text-[#2D3748] rounded-bl-md'
+                  }`}
+                >
+                  {msg.content}
+                </div>
+              </div>
+            ))
+          )}
+
           {isTyping && (
             <div className="flex justify-start">
               <div className="message-bubble bg-white/60 text-[#2D3748] rounded-bl-md flex items-center gap-2">
                 <div className="voice-wave">
-                  <div className="voice-bar"></div>
-                  <div className="voice-bar"></div>
-                  <div className="voice-bar"></div>
-                  <div className="voice-bar"></div>
-                  <div className="voice-bar"></div>
+                  <div className="voice-bar" />
+                  <div className="voice-bar" />
+                  <div className="voice-bar" />
+                  <div className="voice-bar" />
+                  <div className="voice-bar" />
                 </div>
                 <span className="text-xs text-[#8B5CF6]">Thinking...</span>
               </div>
             </div>
           )}
-          
-          {isSpeaking && (
-            <div className="flex justify-start">
-              <div className="message-bubble bg-white/60 text-[#2D3748] rounded-bl-md flex items-center gap-2">
-                <span className="text-xs text-[#8B5CF6]">🔊 Speaking...</span>
-              </div>
-            </div>
-          )}
-          
           <div ref={messagesEndRef} />
         </div>
+
+        {chatError && (
+          <p className="text-sm text-red-500 mb-2 text-center" role="alert">
+            {chatError}
+          </p>
+        )}
 
         <div className="flex items-center gap-2">
           <button
             onClick={startListening}
-            disabled={isListening || isSpeaking || isTyping}
-            className={`p-3 rounded-full ${
-              isListening 
-                ? 'bg-red-500 animate-pulse' 
-                : 'glass-button text-white'
-            } ${isTyping ? 'opacity-50' : ''}`}
+            disabled={isListening || speaking || isTyping || !sttSupported}
+            className={`p-3 rounded-full ${isListening ? 'bg-red-500 animate-pulse' : 'glass-button text-white'} ${
+              isListening || speaking || isTyping || !sttSupported ? 'opacity-50 cursor-not-allowed' : ''
+            }`}
+            aria-label="Voice input"
           >
-            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-              <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
-              <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+              <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
             </svg>
           </button>
-          
+
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Type a message..."
+            placeholder={hasPersona ? 'Type or tap the mic...' : 'Finish the interview first'}
             className="flex-1 glass-input px-4 py-3 rounded-full outline-none"
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-            disabled={isTyping}
+            disabled={isTyping || !hasPersona}
           />
-          
+
           <button
-            onClick={handleSend}
-            disabled={!input.trim() || isTyping}
+            onClick={() => handleSend()}
+            disabled={!input.trim() || isTyping || !hasPersona}
             className={`p-3 rounded-full glass-button text-white ${
-              !input.trim() || isTyping ? 'opacity-50' : ''
+              !input.trim() || isTyping || !hasPersona ? 'opacity-50 cursor-not-allowed' : ''
             }`}
+            aria-label="Send message"
           >
-            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
             </svg>
           </button>
         </div>
@@ -252,7 +326,7 @@ export default function Chat({ personaData, userName }) {
         {isListening && (
           <div className="mt-2 text-center">
             <span className="text-sm text-[#8B5CF6] animate-pulse">
-              🎤 Listening: "{transcript}"
+              🎤 {transcript || 'Listening...'}
             </span>
           </div>
         )}
